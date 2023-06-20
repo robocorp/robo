@@ -136,7 +136,7 @@ func (m model) View() string {
 			faintText("\nPress ctrl-c to abort"),
 		)
 	case StateDone:
-		guide := ("Created project ✨" +
+		guide := ("Created project ✨\n" +
 			faintText("To run the project ") +
 			"cd " + m.dirName +
 			faintText(" and then ") +

@@ -1,172 +1,273 @@
-import functools
+import json
 import logging
-import random
-import time
-from typing import List, cast
+import mimetypes
+import os
+from functools import lru_cache
+from pathlib import Path
+from typing import TYPE_CHECKING, Optional, Union
 
-import requests
+from ._client import AssetNotFound, AssetUploadFailed
 
-from ._requests import RequestsHTTPError
-from ._storage import Asset, AssetMeta, AssetNotFound, AssetUploadFailed
-from ._storage import get_assets_client as _get_assets_client
+if TYPE_CHECKING:
+    from ._client import AssetsClient
+    from ._requests import Response
 
 __version__ = "0.2.0"
 version_info = [int(x) for x in __version__.split(".")]
 
+JSON = Union[dict[str, "JSON"], list["JSON"], str, int, float, bool, None]
+
 LOGGER = logging.getLogger(__name__)
 
-
-def _handle_missing_asset(response: requests.Response, *, name: str, asset_id: str):
-    assets_client = _get_assets_client()
-    try:
-        assets_client.handle_error(response)
-    except RequestsHTTPError as exc:
-        if exc.status_code == 404:
-            # NOTE(cmin764): Any `404 Not Found` error won't be retried and will
-            #  bubble-up from the first request.
-            message = f"Asset {name!r} with id {asset_id!r} not found"
-            raise AssetNotFound(
-                message, status_code=exc.status_code, status_message=exc.status_message
-            ) from exc
-        else:
-            raise exc
+# Known (additional) mimetypes from file extensions
+KNOWN_MIMETYPES = [
+    ("text/x-yaml", ".yml"),
+    ("text/x-yaml", ".yaml"),
+]
 
 
-def list_assets() -> List[AssetMeta]:
+@lru_cache(maxsize=1)
+def _get_client() -> "AssetsClient":
+    """
+    Creates and returns an Asset Storage API client based on the injected
+    environment variables from Control Room (or RCC).
+    """
+    from ._client import AssetsClient
+    from ._environment import get_endpoint, get_token, get_workspace
+
+    workspace = get_workspace()
+    endpoint = get_endpoint()
+    token = get_token()
+
+    return AssetsClient(workspace, endpoint, token)
+
+
+def list_assets() -> list[str]:
     """List all the existing assets.
 
     Returns:
-        A list of assets where each asset is a dictionary with fields like 'id' and
-        'name'
+        A list of available assets' names
     """
-    assets_client = _get_assets_client()
-    assets = assets_client.get("").json()
-    LOGGER.debug("Retrieved %d assets", len(assets))
-    return assets
-
-
-def _retrieve_asset_id(name: str) -> str:
-    for asset in list_assets():
-        if asset["name"] == name:
-            asset_id = asset["id"]
-            LOGGER.debug("Found existing asset %r with id: %s", name, asset_id)
-            return asset_id
-
-    LOGGER.warning("No asset with name %r found, assuming id", name)
-    return name
-
-
-def _get_asset(name: str) -> Asset:
-    asset_id = _retrieve_asset_id(name)
-
-    assets_client = _get_assets_client()
-    _handle_error = functools.partial(
-        _handle_missing_asset, name=name, asset_id=asset_id
-    )
-    response = assets_client.get(asset_id, _handle_error=_handle_error)
-    return cast(Asset, response.json())
-
-
-def get_asset(name: str) -> str:
-    """Get an asset's value by providing its `name`.
-
-    Args:
-        name: Name of the asset
-
-    Returns:
-        The previously set value of this asset, or empty string if not set
-
-    Raises:
-        AssetNotFound: Asset with the given name does not exist
-    """
-    LOGGER.info("Retrieving asset: %r", name)
-    payload = _get_asset(name)["payload"]
-    if payload["type"] == "empty":
-        LOGGER.warning("Asset %r has no value set", name)
-        return ""
-
-    assets_client = _get_assets_client()
-    url = payload["url"]
-    return assets_client.get(url, headers={}).text
-
-
-def _create_asset(name: str) -> Asset:
-    LOGGER.debug("Creating new asset with name: %r", name)
-    assets_client = _get_assets_client()
-    body = {"name": name}
-    return assets_client.post("", json=body).json()
-
-
-def set_asset(name: str, value: str, wait: bool = True):
-    """Creates or updates an asset named `name` with the provided `value`.
-
-    Args:
-        name: Name of the existing or new asset to create (if missing)
-        value: The new value to set within the asset
-        wait: Wait for value to be set successfully
-
-    Raises:
-        AssetUploadFailed: Unexpected error while uploading the asset
-    """
-    try:
-        asset_id = _get_asset(name)["id"]
-        LOGGER.debug("Updating existing asset with id: %r", asset_id)
-    except AssetNotFound:
-        asset_id = _create_asset(name)["id"]
-        LOGGER.debug("Created new asset with id: %r", asset_id)
-
-    assets_client = _get_assets_client()
-    body = {"content_type": "text/plain"}
-    upload_data = assets_client.post(f"{asset_id}/upload", json=body).json()
-    assets_client.put(upload_data["upload_url"], data=value, headers={})
-
-    if not wait:
-        return
-
-    LOGGER.info("Waiting for asset %r value to update successfully", name)
-    upload_url = f"{asset_id}/uploads/{upload_data['id']}"
-    while True:
-        upload_data = assets_client.get(upload_url).json()
-        status = upload_data["status"]
-        if status == "pending":
-            sleep_time = round(random.uniform(0, 1), 2)
-            LOGGER.debug("Asset upload still pending, sleeping %.2f...", sleep_time)
-            time.sleep(sleep_time)
-            continue
-        elif status == "completed":
-            break
-        elif status == "failed":
-            reason = upload_data["reason"]
-            raise AssetUploadFailed(f"Asset {name!r} upload failed: {reason}")
-        else:
-            raise AssetUploadFailed(f"Asset {name!r} got invalid status: {status}")
-
-    LOGGER.info("Asset %r set successfully", name)
+    return [asset["name"] for asset in _get_client().list_assets()]
 
 
 def delete_asset(name: str):
     """Delete an asset by providing its `name`.
 
+    This operation cannot be undone.
+
     Args:
-        name: Name of the asset to delete
+        name: Asset to delete
 
     Raises:
         AssetNotFound: Asset with the given name does not exist
     """
-    LOGGER.info("Deleting asset: %r", name)
-    asset_id = _retrieve_asset_id(name)
-    assets_client = _get_assets_client()
-    _handle_error = functools.partial(
-        _handle_missing_asset, name=name, asset_id=asset_id
-    )
-    assets_client.delete(asset_id, _handle_error=_handle_error)
+    LOGGER.info("Deleting asset: %s", name)
+    client = _get_client()
+    client.delete_asset(asset_id=f"name:{name}")
+
+
+def _get_asset(name: str) -> "Response":
+    """Get an asset's payload URL."""
+    from ._requests import Requests
+
+    client = _get_client()
+    details = client.get_asset(asset_id=f"name:{name}")
+    payload = details["payload"]
+
+    if payload["type"] == "url":
+        url = payload["url"]
+        return Requests().get(url)
+    if payload["type"] == "empty":
+        raise ValueError(
+            f"Asset {details['name']!r} is empty."
+            + " It could mean an upload is still pending"
+            + " or has previously failed."
+        )
+    else:
+        # Note (2023-07-04):
+        # The 'data' payload type should only be used when uploading,
+        # and it should never be in the response when getting an asset.
+        raise RuntimeError(f"Unsupported payload type: {payload['type']}")
+
+
+def get_text(name: str) -> str:
+    """Return the given asset as text.
+
+    Arguments:
+        name: Name of asset
+
+    Returns:
+        Asset content as text
+
+    Raises:
+        AssetNotFound: No asset defined with given name
+    """
+    response = _get_asset(name)
+    return response.text
+
+
+def get_json(name: str, **kwargs) -> JSON:
+    """Return the given asset as a deserialized JSON object.
+
+    Arguments:
+        name: Name of asset
+        **kwargs: Additional parameters for `json.loads`
+
+    Returns:
+        Asset content as a Python object (dict, list etc.)
+
+    Raises:
+        AssetNotFound: No asset defined with given name
+        JSONDecodeError: Asset was not valid JSON
+    """
+    response = _get_asset(name)
+    return response.json(**kwargs)
+
+
+def get_file(name: str, path: Union[os.PathLike, str], exist_ok=False) -> Path:
+    """Fetch the given asset and store it in a file.
+
+    Arguments:
+        name: Name of asset
+        path: Destination path for downloaded file
+        exist_ok: Overwrite file if it already exists
+
+    Returns:
+        Path to created file
+
+    Raises:
+        AssetNotFound: No asset defined with given name
+        FileExistsError: Destination already exists
+    """
+    response = _get_asset(name)
+
+    path = Path(path).absolute()
+    if path.exists() and not exist_ok:
+        raise FileExistsError(f"File already exists: {path}")
+
+    path.write_bytes(response.content)
+
+    return path
+
+
+def get_bytes(name: str) -> bytes:
+    """Return the given asset as bytes.
+
+    Arguments:
+        name: Name of asset
+
+    Returns:
+        Asset content as bytes
+
+    Raises:
+        AssetNotFound: No asset defined with given name
+    """
+    response = _get_asset(name)
+    return response.content
+
+
+def _set_asset(name: str, content: bytes, content_type: str, wait: bool):
+    """Upload asset content, and create asset if it doesn't already exist."""
+    client = _get_client()
+
+    try:
+        details = client.get_asset(asset_id=f"name:{name}")
+        LOGGER.debug("Updating existing asset with id: %s", details["id"])
+    except AssetNotFound:
+        details = client.create_asset(name=name)
+        LOGGER.debug("Created new asset with id: %s", details["id"])
+
+    LOGGER.info("Uploading asset (content-type: %s)", name, content_type)
+    client.upload_asset(details["id"], content, content_type, wait)
+
+
+def set_text(name: str, text: str, wait: bool = True):
+    """Create or update an asset to contain the given string.
+
+    Arguments:
+        name: Name of asset
+        text: Text content for asset
+        wait: Wait for asset to update
+    """
+    content = text.encode("utf-8")
+    content_type = "text/plain"
+    _set_asset(name, content, content_type, wait)
+
+
+def set_json(name: str, value: JSON, wait: bool = True, **kwargs):
+    """Create or update an asset to contain the given object, serialized as JSON.
+
+    Arguments:
+        name: Name of asset
+        value: Value for asset, e.g. dict or list
+        wait: Wait for asset to update
+        **kwargs: Additional arguments for `json.dumps`
+    """
+    content = json.dumps(value, **kwargs).encode("utf-8")
+    content_type = "application/json"
+    _set_asset(name, content, content_type, wait)
+
+
+def set_file(
+    name: str,
+    path: Union[os.PathLike, str],
+    content_type: Optional[str] = None,
+    wait: bool = True,
+):
+    """Create or update an asset to contain the contents of the given file.
+
+    Arguments:
+        name: Name of asset
+        path: Path to file
+        content_type: Content type (or mimetype) of file, detected automatically
+          from file extension if not defined
+        wait: Wait for asset to update
+    """
+    if content_type is None:
+        for type_, ext in KNOWN_MIMETYPES:
+            mimetypes.add_type(type_, ext)
+
+        content_type, _ = mimetypes.guess_type(path)
+        if content_type is not None:
+            LOGGER.info("Detected content type %r", content_type)
+        else:
+            content_type = "application/octet-stream"
+            LOGGER.info("Unable to detect content type, using %r", content_type)
+
+    content = path.read_bytes()
+
+    _set_asset(name, content, content_type, wait)
+
+
+def set_bytes(
+    name: str,
+    data: bytes,
+    content_type="application/octet-stream",
+    wait: bool = True,
+):
+    """Create or update an asset to contain the given bytes.
+
+    Arguments:
+        name: Name of asset
+        data: Raw content
+        content_type: Content type (or mimetype) of asset
+        wait: Wait for asset to update
+    """
+    _set_asset(name, data, content_type, wait)
 
 
 __all__ = [
     "AssetNotFound",
     "AssetUploadFailed",
-    "delete_asset",
-    "get_asset",
     "list_assets",
-    "set_asset",
+    "delete_asset",
+    "get_text",
+    "get_json",
+    "get_file",
+    "get_bytes",
+    "set_text",
+    "set_json",
+    "set_file",
+    "set_bytes",
 ]
